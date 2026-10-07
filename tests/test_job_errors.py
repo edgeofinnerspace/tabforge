@@ -42,6 +42,19 @@ class TestSeparateStemsErrors(unittest.TestCase):
         self.assertIn("could not load model", str(ctx.exception))
         self.assertNotIsInstance(ctx.exception, SystemExit)
 
+    def test_sigkill_explains_likely_memory_limit(self):
+        failed = _FakePopen(
+            returncode=-9,
+            stderr="100% 52.4M/52.4M downloaded")
+        with mock.patch.object(transcribe.subprocess, "Popen",
+                               return_value=failed):
+            with self.assertRaises(RuntimeError) as ctx:
+                transcribe.separate_stems(Path("x.wav"), Path("/tmp/out"))
+        message = str(ctx.exception)
+        self.assertIn("SIGKILL", message)
+        self.assertIn("memory limit", message)
+        self.assertIn("52.4M", message)
+
     def test_runs_demucs_in_subprocess(self):
         # The in-process demucs API call must never come back: a SystemExit
         # raised inside it would escape `except Exception` in the server.

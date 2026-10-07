@@ -15,20 +15,21 @@ Public-deployment knobs (environment variables):
   TABFORGE_MAX_DURATION_S audio length limit, seconds (default 600)
   TABFORGE_JOB_TTL_S      keep finished jobs this long (default 7200)
   TABFORGE_MAX_JOBS       stored-jobs cap (default 20)
+    TABFORGE_JOBS_DIR       persistent job storage (default ~/.cache/tabforge/jobs)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import threading
 import time
 import uuid
+from dataclasses import asdict, dataclass, field
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import mkdtemp
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -37,7 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from ..audio.keydetect import Key
 from ..audio.transcribe import abort_separation
 from ..core.fretboard import TUNINGS
-from ..pipeline import (STAGES, AnalyzeResult, PipelineOptions,
+from ..pipeline import (STAGES, AnalyzeResult, PipelineOptions, StemAnalysis,
                         apply_bulk_edit, apply_repin, export_reference,
                         run_analyze, run_analyze_midi, run_transcribe)
 
@@ -46,7 +47,10 @@ if getattr(sys, "frozen", False):
     FRONTEND = Path(getattr(sys, "_MEIPASS")) / "frontend"
 else:
     FRONTEND = Path(__file__).resolve().parent.parent.parent.parent / "frontend"
-WORK_ROOT = Path(mkdtemp(prefix="tabforge_"))
+JOBS_STORAGE = Path(os.environ.get(
+    "TABFORGE_JOBS_DIR", str(Path.home() / ".cache" / "tabforge" / "jobs")))
+WORK_ROOT = JOBS_STORAGE / "work"
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
 TOKEN = os.environ.get("TABFORGE_TOKEN", "")
 WORKERS = int(os.environ.get("TABFORGE_WORKERS", "1"))
@@ -88,6 +92,7 @@ class Job:
     # an open session must never expire under the user (calibration
     # session 2 lost two hours of flags to the TTL sweeper)
     last_access: float = field(default_factory=time.time)
+    persisted_access: float = field(default_factory=time.time, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock)
     cancel: threading.Event = field(default_factory=threading.Event)
 
@@ -104,6 +109,151 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 POOL = ThreadPoolExecutor(max_workers=max(1, WORKERS))
+
+
+def _serialize_analysis(analyzed: AnalyzeResult, job_dir: Path) -> dict:
+    stems = {}
+    for name, path in analyzed.stems.items():
+        try:
+            stems[name] = str(path.relative_to(job_dir))
+        except ValueError:
+            continue
+    midi_source = None
+    if analyzed.midi_source:
+        try:
+            midi_source = str(analyzed.midi_source.relative_to(job_dir))
+        except ValueError:
+            pass
+    return {
+        "stems": stems,
+        "analysis": {name: asdict(item)
+                     for name, item in analyzed.analysis.items()},
+        "bpm": analyzed.bpm, "beats": analyzed.beats,
+        "tempo_reliable": analyzed.tempo_reliable,
+        "key": asdict(analyzed.key) if analyzed.key else None,
+        "warnings": analyzed.warnings, "midi_source": midi_source,
+        "solo": analyzed.solo, "meter": analyzed.meter,
+        "meter_changes": analyzed.meter_changes,
+    }
+
+
+def save_job_to_disk(job: Job) -> None:
+    """Atomically persist the job snapshot; its working files live beside it."""
+    if not job.dir:
+        return
+    try:
+        with job.lock:
+            data = {
+                "id": job.id, "status": job.status, "stage": job.stage,
+                "log": job.log[-100:], "analysis": job.analysis,
+                "results": job.results, "error": job.error,
+                "bpm": job.bpm, "backing": job.backing,
+                "song": job.song, "title": job.title,
+                "created_at": job.created_at,
+                "finished_at": job.finished_at,
+                "last_access": job.last_access,
+                "audio": (str(job.audio.relative_to(job.dir))
+                          if job.audio else None),
+                "analyzed": (_serialize_analysis(job.analyzed, job.dir)
+                             if job.analyzed else None),
+                "opts": asdict(job.opts) if job.opts else None,
+            }
+            JOBS_STORAGE.mkdir(parents=True, exist_ok=True)
+            target = JOBS_STORAGE / f"{job.id}.json"
+            temporary = JOBS_STORAGE / f".{job.id}.{uuid.uuid4().hex}.tmp"
+            temporary.write_text(json.dumps(data), encoding="utf-8")
+            temporary.replace(target)
+            job.persisted_access = job.last_access
+    except Exception:  # noqa: BLE001 — in-memory state remains usable
+        try:
+            temporary.unlink(missing_ok=True)
+        except (UnboundLocalError, OSError):
+            pass
+
+
+def load_job_from_disk(job_id: str) -> Job | None:
+    """Restore a job snapshot and its stable working directory."""
+    if len(job_id) != 12 or any(c not in "0123456789abcdef" for c in job_id):
+        return None
+    path = JOBS_STORAGE / f"{job_id}.json"
+    job_dir = WORK_ROOT / job_id
+    if not path.is_file() or not job_dir.is_dir():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("id") != job_id:
+            return None
+        job = Job(id=job_id)
+        job.dir = job_dir
+        job.status = data.get("status", "error")
+        job.stage = data.get("stage", "")
+        job.log = data.get("log", [])
+        job.analysis = data.get("analysis", [])
+        job.results = data.get("results", [])
+        job.error = data.get("error", "")
+        job.bpm = data.get("bpm", 0.0)
+        job.backing = data.get("backing", "")
+        job.song = data.get("song", "")
+        job.title = data.get("title", "Track")
+        job.created_at = data.get("created_at", time.time())
+        job.finished_at = data.get("finished_at")
+        job.last_access = data.get("last_access", time.time())
+        job.persisted_access = job.last_access
+
+        def stored_path(relative):
+            if not relative:
+                return None
+            candidate = (job_dir / relative).resolve()
+            return candidate if job_dir.resolve() in candidate.parents else None
+
+        job.audio = stored_path(data.get("audio"))
+        analyzed_data = data.get("analyzed")
+        if analyzed_data:
+            key_data = analyzed_data.get("key")
+            job.analyzed = AnalyzeResult(
+                stems={name: stored_path(value)
+                       for name, value in analyzed_data.get("stems", {}).items()
+                       if stored_path(value)},
+                analysis={name: StemAnalysis(**item)
+                          for name, item in analyzed_data.get("analysis", {}).items()},
+                bpm=analyzed_data.get("bpm", 0.0),
+                beats=analyzed_data.get("beats", []),
+                tempo_reliable=analyzed_data.get("tempo_reliable", False),
+                key=Key(**key_data) if key_data else None,
+                warnings=analyzed_data.get("warnings", []),
+                midi_source=stored_path(analyzed_data.get("midi_source")),
+                solo=analyzed_data.get("solo", False),
+                meter=analyzed_data.get("meter", 4),
+                meter_changes=analyzed_data.get("meter_changes", []),
+            )
+        opts_data = data.get("opts")
+        if opts_data:
+            job.opts = PipelineOptions(**{
+                **opts_data, "stems": tuple(opts_data.get("stems", ()))})
+        if job.status in ("queued", "running"):
+            job.status = "error"
+            job.error = "Server restarted while this job was running"
+            job.finished_at = time.time()
+            save_job_to_disk(job)
+        return job
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _get_job(job_id: str) -> Job | None:
+    job = JOBS.get(job_id)
+    if job is None:
+        job = load_job_from_disk(job_id)
+        if job is not None:
+            JOBS[job_id] = job
+    return job
+
+
+def _restore_persisted_jobs() -> None:
+    for path in JOBS_STORAGE.glob("[0-9a-f]" * 12 + ".json"):
+        job = load_job_from_disk(path.stem)
+        if job is not None:
+            JOBS[job.id] = job
 
 app = FastAPI(title="TabForge")
 
@@ -133,6 +283,7 @@ def _drop_job(job_id: str) -> None:
     job = JOBS.pop(job_id, None)
     if job and job.dir:
         shutil.rmtree(job.dir, ignore_errors=True)
+    (JOBS_STORAGE / f"{job_id}.json").unlink(missing_ok=True)
 
 
 def cleanup_jobs(now: float | None = None) -> int:
@@ -177,14 +328,21 @@ def _cleanup_loop() -> None:
 async def _touch_job_middleware(request, call_next):
     parts = request.url.path.split("/")
     if len(parts) > 3 and parts[1] == "api" and parts[2] == "jobs":
-        job = JOBS.get(parts[3])
+        job = _get_job(parts[3])
         if job:
-            job.last_access = time.time()
+            now = time.time()
+            with job.lock:
+                persist_touch = now - job.persisted_access >= 60.0
+                job.last_access = now
+            if persist_touch:
+                save_job_to_disk(job)
     return await call_next(request)
 
 
 @app.on_event("startup")
 def _start_cleanup_thread() -> None:
+    _restore_persisted_jobs()
+    cleanup_jobs()
     threading.Thread(target=_cleanup_loop, daemon=True,
                      name="tabforge-job-cleanup").start()
 
@@ -237,6 +395,7 @@ def _progress_fn(job: Job):
         with job.lock:
             job.stage = stage
             job.log.append(msg)
+        save_job_to_disk(job)
     return progress
 
 
@@ -245,17 +404,22 @@ def _run_analyze(job: Job, audio: Path,
                  use_mt3: bool = True,
                  solo: bool = False) -> None:
     with job.lock:
-        if job.cancel.is_set():          # canceled while still queued
+        canceled = job.cancel.is_set()   # canceled while still queued
+        if canceled:
             job.status = "canceled"
             job.finished_at = time.time()
-            return
-        job.status = "running"
+        else:
+            job.status = "running"
+    save_job_to_disk(job)
+    if canceled:
+        return
     try:
         def _on_card(analysis: dict) -> None:
             # progressive cards (task 76): partial analysis reaches
             # the poll loop while the arbiter is still listening
             with job.lock:
                 job.analysis = [a.to_dict() for a in analysis.values()]
+            save_job_to_disk(job)
 
         analyzed = run_analyze(audio, job.dir / "out", _progress_fn(job),
                                cancel_token=job.id, separator=separator,
@@ -268,6 +432,7 @@ def _run_analyze(job: Job, audio: Path,
                             for a in analyzed.analysis.values()]
             job.status = "analyzed"
             job.stage = "analyze"
+        save_job_to_disk(job)
     except Exception as e:  # noqa: BLE001 — shown to the user
         with job.lock:
             # a killed demucs also surfaces as an exception: any failure
@@ -284,16 +449,21 @@ def _run_analyze(job: Job, audio: Path,
                 job.error = job.error or "analysis crashed unexpectedly"
             if job.status in ("error", "canceled"):
                 job.finished_at = time.time()
+        save_job_to_disk(job)
 
 
 def _run_analyze_midi_job(job: Job, midi: Path) -> None:
     """The MIDI drop path: instant analyze, same job lifecycle."""
     with job.lock:
-        if job.cancel.is_set():
+        canceled = job.cancel.is_set()
+        if canceled:
             job.status = "canceled"
             job.finished_at = time.time()
-            return
-        job.status = "running"
+        else:
+            job.status = "running"
+    save_job_to_disk(job)
+    if canceled:
+        return
     try:
         analyzed = run_analyze_midi(midi, job.dir / "out",
                                     _progress_fn(job))
@@ -304,6 +474,7 @@ def _run_analyze_midi_job(job: Job, midi: Path) -> None:
                             for a in analyzed.analysis.values()]
             job.status = "analyzed"
             job.stage = "analyze"
+        save_job_to_disk(job)
     except Exception as e:  # noqa: BLE001 — shown to the user
         with job.lock:
             job.status = "error"
@@ -315,6 +486,7 @@ def _run_analyze_midi_job(job: Job, midi: Path) -> None:
                 job.error = job.error or "MIDI analysis crashed"
             if job.status in ("error", "canceled"):
                 job.finished_at = time.time()
+        save_job_to_disk(job)
 
 
 def _run_transcribe(job: Job, opts: PipelineOptions) -> None:
@@ -322,6 +494,7 @@ def _run_transcribe(job: Job, opts: PipelineOptions) -> None:
         job.status = "running"
         job.results = []
         job.backing = ""
+    save_job_to_disk(job)
     try:
         results = run_transcribe(job.dir / "out", job.analyzed, opts,
                                  _progress_fn(job))
@@ -337,6 +510,7 @@ def _run_transcribe(job: Job, opts: PipelineOptions) -> None:
                 job.song = f"/api/jobs/{job.id}/files/song/song.gp5"
             job.status = "done"
             job.stage = "done"
+        save_job_to_disk(job)
     except Exception as e:  # noqa: BLE001 — shown to the user
         with job.lock:
             if job.cancel.is_set() and job.analyzed is not None:
@@ -358,6 +532,7 @@ def _run_transcribe(job: Job, opts: PipelineOptions) -> None:
                 job.error = job.error or "job crashed unexpectedly"
             if job.status != "analyzed":
                 job.finished_at = time.time()
+        save_job_to_disk(job)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +595,7 @@ async def create_job(file: UploadFile,
                    if c.isalnum() or c in " ._-")[:60].strip()
     job.title = safe or "Track"
     JOBS[job.id] = job
+    save_job_to_disk(job)
     if is_midi(audio):
         POOL.submit(_run_analyze_midi_job, job, audio)
     else:
@@ -433,7 +609,7 @@ async def create_job(file: UploadFile,
 async def transcribe_job(job_id: str, selection: dict) -> dict:
     """Step 2: transcribe the selected stems from the CACHED separation.
     May be called again with a different selection — demucs never reruns."""
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     with job.lock:
@@ -493,6 +669,7 @@ async def transcribe_job(job_id: str, selection: dict) -> dict:
                      if selection.get("lyrics_lang") else None),
     )
     job.opts = opts
+    save_job_to_disk(job)
     POOL.submit(_run_transcribe, job, opts)
     return {"id": job.id}
 
@@ -502,7 +679,7 @@ async def cancel_job(job_id: str) -> dict:
     """Stop a running analyze or transcribe. Cancel during analyze ends
     the job; cancel during transcribe drops back to the instrument
     picker (the cached separation survives)."""
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     with job.lock:
@@ -511,6 +688,7 @@ async def cancel_job(job_id: str) -> dict:
                 409, f"Nothing to cancel (status: {job.status})")
         job.cancel.set()
         job.log.append("stopping…")
+    save_job_to_disk(job)
     # demucs won't reach a cooperative checkpoint for minutes — kill it
     abort_separation(job.id)
     return {"id": job.id, "status": "canceling"}
@@ -520,7 +698,7 @@ async def cancel_job(job_id: str) -> dict:
 async def repin_note(job_id: str, req: dict) -> dict:
     """Note editor: pin a note to a string (string=null removes the pin)
     and re-run the fingering around it. Fast — pure math, no audio."""
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -546,6 +724,7 @@ async def repin_note(job_id: str, req: dict) -> dict:
         for r in job.results:
             if r.get("stem") == part and result["ascii"]:
                 r["ascii"] = result["ascii"]
+    save_job_to_disk(job)
     return {"prev": result["prev"], "song": job.song}
 
 
@@ -556,7 +735,7 @@ async def repin_group(job_id: str, req: dict) -> dict:
     `restore` (note_index -> previous pin) is the undo path."""
     from ..pipeline import apply_repin_group
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -585,6 +764,7 @@ async def repin_group(job_id: str, req: dict) -> dict:
         for r in job.results:
             if r.get("stem") == part and result["ascii"]:
                 r["ascii"] = result["ascii"]
+    save_job_to_disk(job)
     return {"count": result["count"], "prev_pins": result["prev_pins"],
             "song": job.song}
 
@@ -594,7 +774,7 @@ async def bulk_edit(job_id: str, req: dict) -> dict:
     """Mass editor op (task 55): every note of a part inside a
     drag-selected range — octave shift, delete, collapse octave
     doubles, or reassign to another part. Pure math, no audio."""
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -623,6 +803,7 @@ async def bulk_edit(job_id: str, req: dict) -> dict:
             new_ascii = result["ascii"].get(r.get("stem"))
             if new_ascii:
                 r["ascii"] = new_ascii
+    save_job_to_disk(job)
     return {"count": result["count"], "song": job.song}
 
 
@@ -631,7 +812,7 @@ async def part_notes(job_id: str, part: str) -> dict:
     """Note positions + confidence for the Review-mode overlay."""
     from ..pipeline import part_note_meta
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -720,7 +901,7 @@ async def add_flag(job_id: str, flag: dict) -> dict:
     import json
     import time as _time
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     text = str(flag.get("text", ""))[:500]
@@ -752,7 +933,7 @@ async def add_flag(job_id: str, flag: dict) -> dict:
 async def list_flags(job_id: str) -> dict:
     import json
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     path = job.dir / "out" / "flags.json"
@@ -766,7 +947,7 @@ async def chords(job_id: str) -> dict:
     alphaTab quarter-ticks and fret diagrams from the actual tab."""
     import json
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     path = (job.dir / "out" / "chords.json") if job.dir else None
@@ -780,7 +961,7 @@ async def lyrics(job_id: str) -> dict:
     """Word-level synced lyrics (task 60)."""
     import json
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     path = (job.dir / "out" / "lyrics.json") if job.dir else None
@@ -798,7 +979,7 @@ async def toggle_lyrics_segment(job_id: str, req: dict) -> dict:
     from ..pipeline import Grid, _rebuild_outputs, scale_beats
     from ..audio.lyrics import to_lrc
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -834,7 +1015,7 @@ async def sections(job_id: str) -> dict:
     """Song structure (task 59): auto-detected, human-renamable."""
     import json
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     path = (job.dir / "out" / "sections.json") if job.dir else None
@@ -851,7 +1032,7 @@ async def rename_section(job_id: str, req: dict) -> dict:
 
     from ..pipeline import Grid, _rebuild_outputs, scale_beats
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done" or job.opts is None:
@@ -887,7 +1068,7 @@ async def reference_zip(job_id: str):
     """Export the CURRENT (post-edit) notes as per-instrument MIDI
     named like the golden corpus — the correction becomes ground
     truth for the eval stand."""
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done":
@@ -903,7 +1084,7 @@ async def reference_zip(job_id: str):
 
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str) -> dict:
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     return job.public()
@@ -911,7 +1092,7 @@ async def job_status(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/files/{stem}/{name}")
 async def job_file(job_id: str, stem: str, name: str) -> FileResponse:
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job or not job.dir:
         raise HTTPException(404, "Job not found")
     path = (job.dir / "out" / stem / name).resolve()
@@ -935,7 +1116,7 @@ async def export_project(job_id: str):
     import json
     import zipfile
 
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     with job.lock:

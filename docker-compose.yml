@@ -15,6 +15,7 @@ services:
       TABFORGE_MAX_DURATION_S: "${TABFORGE_MAX_DURATION_S:-600}"
       TABFORGE_JOB_TTL_S: "${TABFORGE_JOB_TTL_S:-7200}"
       TABFORGE_MAX_JOBS: "${TABFORGE_MAX_JOBS:-20}"
+      TABFORGE_JOBS_DIR: "${TABFORGE_JOBS_DIR:-/home/tabforge/.cache/tabforge/jobs}"
 
   # Public access via Cloudflare quick tunnel (no account, no public IP):
   #   TABFORGE_TOKEN=<secret> docker compose --profile tunnel up -d

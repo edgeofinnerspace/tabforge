@@ -1,6 +1,7 @@
 """Limits, validation, auth, and job-lifecycle tests for the server API.
 Uses FastAPI's TestClient (httpx); skipped in core-only CI installs."""
 import io
+import tempfile
 import threading
 import time
 import unittest
@@ -41,6 +42,11 @@ class ServerTestCase(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(srv.app)
         srv.JOBS.clear()
+        storage = tempfile.TemporaryDirectory()
+        self.addCleanup(storage.cleanup)
+        self.set("JOBS_STORAGE", Path(storage.name))
+        self.set("WORK_ROOT", Path(storage.name) / "work")
+        srv.WORK_ROOT.mkdir(parents=True, exist_ok=True)
         # keep the real pipeline out of these tests
         from tabforge.pipeline import AnalyzeResult
         self.fake_analysis = AnalyzeResult(
@@ -374,6 +380,45 @@ class TestJobLifecycle(ServerTestCase):
         job.last_access = time.time() - age_s
         srv.JOBS[job.id] = job
         return job
+
+    def test_job_state_round_trips_and_interrupted_jobs_fail(self):
+        from tabforge.audio.keydetect import Key
+        from tabforge.pipeline import (AnalyzeResult, PipelineOptions,
+                                       StemAnalysis)
+
+        job = srv.Job(id="a" * 12)
+        job.dir = srv.WORK_ROOT / job.id
+        job.dir.mkdir(parents=True)
+        job.audio = job.dir / "upload.wav"
+        job.analysis = [{"stem": "guitar", "status": "found"}]
+        job.results = [{"stem": "guitar", "ascii": "tab"}]
+        job.status = "done"
+        job.finished_at = time.time()
+        job.analyzed = AnalyzeResult(
+            stems={"guitar": job.dir / "out" / "stems" / "guitar.wav"},
+            analysis={"guitar": StemAnalysis("guitar", "found", 0.4)},
+            bpm=123.0, beats=[0.0, 0.5], tempo_reliable=True,
+            key=Key(2, True, 0.8), meter=3)
+        job.opts = PipelineOptions(stems=("guitar",), subdivision=3,
+                                   treat={"guitar": "piano"})
+        srv.save_job_to_disk(job)
+
+        restored = srv.load_job_from_disk(job.id)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.status, "done")
+        self.assertEqual(restored.analyzed.bpm, 123.0)
+        self.assertEqual(restored.analyzed.key.name, "D minor")
+        self.assertEqual(restored.analyzed.meter, 3)
+        self.assertEqual(restored.opts.stems, ("guitar",))
+        self.assertEqual(restored.opts.treat, {"guitar": "piano"})
+        self.assertEqual(restored.results, job.results)
+        self.assertEqual(restored.audio, job.audio)
+
+        restored.status = "running"
+        srv.save_job_to_disk(restored)
+        recovered = srv.load_job_from_disk(job.id)
+        self.assertEqual(recovered.status, "error")
+        self.assertIn("restarted", recovered.error)
 
     def test_expired_jobs_are_cleaned(self):
         self.set("JOB_TTL_S", 100.0)

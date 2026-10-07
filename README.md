@@ -284,7 +284,9 @@ docker compose up -d --build     # serves http://localhost:8000
 - Everything is configurable from the host environment:
   `TABFORGE_TOKEN` (require an API token), `TABFORGE_WORKERS`,
   `TABFORGE_MAX_UPLOAD_MB`, `TABFORGE_MAX_DURATION_S`,
-  `TABFORGE_JOB_TTL_S`, `TABFORGE_MAX_JOBS` — e.g.
+  `TABFORGE_JOB_TTL_S`, `TABFORGE_MAX_JOBS`,
+  `TABFORGE_JOBS_DIR` (defaults to `~/.cache/tabforge/jobs`, persisted by
+  the Docker `model-cache` volume) — e.g.
   `TABFORGE_TOKEN=secret docker compose up -d`.
 - Image notes: torch/torchaudio/**torchcodec** all come from the PyTorch
   CPU wheel index (the PyPI torchcodec wheel is CUDA-linked and won't

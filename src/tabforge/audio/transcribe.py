@@ -10,6 +10,7 @@ The chain:
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -106,8 +107,25 @@ def separate_stems(audio: Path, out_dir: Path, model: str = "htdemucs_6s",
             rc = _run("cpu")            # the CPU path always worked
     if rc != 0:
         tail = "\n".join((_run.err or "").strip().splitlines()[-5:])
+        if rc < 0:
+            try:
+                signal_name = signal.Signals(-rc).name
+            except ValueError:
+                signal_name = f"signal {-rc}"
+            message = f"demucs was terminated by {signal_name}"
+            if rc == -signal.SIGKILL:
+                message += (
+                    ". If the job was not canceled, this commonly means "
+                    "the OS or container killed it for exceeding its "
+                    "memory limit; check the service's memory usage/limit "
+                    "and try a shorter input or a larger memory tier"
+                )
+        else:
+            message = f"demucs failed with exit code {rc}"
+        if tail:
+            message += f":\n{tail}"
         raise RuntimeError(
-            f"demucs failed with exit code {rc}:\n{tail}")
+            message)
 
     stem_dir = out_dir / model / audio.stem
     return {p.stem: p for p in stem_dir.glob("*.wav")}
