@@ -7,7 +7,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
+    && apt-get install -y --no-install-recommends ffmpeg libsndfile1 build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,7 +30,8 @@ COPY frontend ./frontend
 # The editable install keeps the package rooted at /app so the server
 # finds frontend/ next to src/ (same layout as the dev checkout).
 RUN echo 'demucs==4.0.1' > /tmp/constraints.txt \
-    && pip install --no-cache-dir Cython \
+    && pip install --no-cache-dir "numpy<2.0" Cython "setuptools<81" wheel \
+    && pip install --no-cache-dir --no-build-isolation "madmom>=0.16.1" \
     && pip install --no-cache-dir -c /tmp/constraints.txt -e ".[ml,export,server,roformer,transcription]"
     
 RUN useradd --create-home tabforge \
