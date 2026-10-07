@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -58,6 +59,15 @@ def _demucs_device() -> str:
     return "cpu"
 
 
+def _has_dns_resolution_error(output: str) -> bool:
+    return any(message in output.lower() for message in (
+        "temporary failure in name resolution",
+        "temporary failure resolving",
+        "name or service not known",
+        "nodename nor servname provided",
+    ))
+
+
 def separate_stems(audio: Path, out_dir: Path, model: str = "htdemucs_6s",
                    cancel_token: object | None = None) -> dict[str, Path]:
     """Splits the mix into stems. Returns {stem_name: wav_path}.
@@ -100,7 +110,16 @@ def separate_stems(audio: Path, out_dir: Path, model: str = "htdemucs_6s",
 
     device = _demucs_device()
     rc = _run(device)
-    if rc != 0 and device != "cpu":
+    for attempt in range(2):
+        if rc == 0 or not _has_dns_resolution_error(_run.err or ""):
+            break
+        with _ACTIVE_LOCK:
+            if cancel_token in _ABORTED:
+                break
+        time.sleep(2 ** attempt)
+        rc = _run(device)
+    dns_failed = _has_dns_resolution_error(_run.err or "")
+    if rc != 0 and device != "cpu" and not dns_failed:
         with _ACTIVE_LOCK:
             aborted = cancel_token in _ABORTED
         if not aborted:                 # a Metal hiccup, not a cancel:
@@ -121,7 +140,14 @@ def separate_stems(audio: Path, out_dir: Path, model: str = "htdemucs_6s",
                     "and try a shorter input or a larger memory tier"
                 )
         else:
-            message = f"demucs failed with exit code {rc}"
+            if dns_failed:
+                message = (
+                    "demucs could not resolve its model download host after "
+                    "retries; check DNS and outbound internet access from "
+                    "the app container"
+                )
+            else:
+                message = f"demucs failed with exit code {rc}"
         if tail:
             message += f":\n{tail}"
         raise RuntimeError(

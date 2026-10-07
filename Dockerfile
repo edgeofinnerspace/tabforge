@@ -33,13 +33,18 @@ RUN echo 'demucs==4.0.1' > /tmp/constraints.txt \
     && pip install --no-cache-dir "numpy<2.0" Cython "setuptools<81" wheel \
     && pip install --no-cache-dir --no-build-isolation "madmom>=0.16.1" \
     && pip install --no-cache-dir -c /tmp/constraints.txt -e ".[ml,export,server,roformer,transcription]"
-    
+
+# Fetch the default separator weights while the image builder has network
+# access; the runtime container may not be able to resolve external hosts.
+ENV TORCH_HOME=/opt/tabforge/torch
+RUN python -c 'from demucs.pretrained import get_model; get_model("htdemucs_6s")'
+
 RUN useradd --create-home tabforge \
     # pre-create the cache mount point owned by the app user: a named
     # volume inherits ownership from the image on first creation, and a
     # root-owned one would break model downloads
-    && mkdir -p /home/tabforge/.cache \
-    && chown -R tabforge:tabforge /home/tabforge/.cache
+    && mkdir -p /home/tabforge/.cache /opt/tabforge/torch \
+    && chown -R tabforge:tabforge /home/tabforge/.cache /opt/tabforge
 USER tabforge
 ENV HOME=/home/tabforge
 # numba (librosa's JIT) must not try to cache next to the root-owned

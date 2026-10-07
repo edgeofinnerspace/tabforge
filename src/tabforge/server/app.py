@@ -232,7 +232,13 @@ def load_job_from_disk(job_id: str) -> Job | None:
                 **opts_data, "stems": tuple(opts_data.get("stems", ()))})
         if job.status in ("queued", "running"):
             job.status = "error"
-            job.error = "Server restarted while this job was running"
+            stage = job.stage or "analysis"
+            job.error = (
+                f"Server restarted during {stage}; this job cannot resume. "
+                "If the restart was unexpected, check service logs and "
+                "memory limits. A restart during Demucs separation can be "
+                "caused by memory pressure."
+            )
             job.finished_at = time.time()
             save_job_to_disk(job)
         return job

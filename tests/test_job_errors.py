@@ -55,6 +55,19 @@ class TestSeparateStemsErrors(unittest.TestCase):
         self.assertIn("memory limit", message)
         self.assertIn("52.4M", message)
 
+    def test_dns_failure_retries_then_reports_container_network(self):
+        failed = _FakePopen(
+            returncode=1,
+            stderr="urllib.error.URLError: Temporary failure in name resolution")
+        with mock.patch.object(transcribe.subprocess, "Popen",
+                               side_effect=[failed, failed, failed]) as popen:
+            with mock.patch.object(transcribe.time, "sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    transcribe.separate_stems(
+                        Path("x.wav"), Path("/tmp/out"))
+        self.assertEqual(popen.call_count, 3)
+        self.assertIn("DNS and outbound internet access", str(ctx.exception))
+
     def test_runs_demucs_in_subprocess(self):
         # The in-process demucs API call must never come back: a SystemExit
         # raised inside it would escape `except Exception` in the server.

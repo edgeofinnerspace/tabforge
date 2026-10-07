@@ -278,9 +278,11 @@ docker compose up -d --build     # serves http://localhost:8000
 
 - The image is `python:3.11-slim` + ffmpeg with the `ml`, `export`, and
   `server` extras (no desktop), running uvicorn as a non-root user.
-- Model weights are **not** baked in: demucs downloads ~50 MB into the
-  `model-cache` volume on the first job and reuses it across container
-  recreations.
+- The default Demucs `htdemucs_6s` weights are fetched during image build,
+  so first-run analysis does not depend on runtime container DNS. Other
+  application caches under `~/.cache` persist in the `model-cache` volume;
+  additional PyTorch checkpoints use the image-local `/opt/tabforge/torch`
+  cache.
 - Everything is configurable from the host environment:
   `TABFORGE_TOKEN` (require an API token), `TABFORGE_WORKERS`,
   `TABFORGE_MAX_UPLOAD_MB`, `TABFORGE_MAX_DURATION_S`,
