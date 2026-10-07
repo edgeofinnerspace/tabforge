@@ -17,6 +17,7 @@ eval = ["mir_eval>=0.7"]
 # High-quality separation backend (BS-Roformer-SW): measurably cleaner
 # stems on the eval stand, ~30x slower than demucs on CPU
 roformer = ["bs-roformer-infer>=0.1.5"]
+transcription = ["MuScriptor>=0.1.0", "madmom>=0.16.1"]
 # Synced lyrics from the vocal stem (faster-whisper, MIT; the model
 # downloads from HF on first use, ~460 MB for "small")
 lyrics = ["faster-whisper>=1.2"]

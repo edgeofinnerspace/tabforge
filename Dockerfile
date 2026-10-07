@@ -30,7 +30,7 @@ COPY frontend ./frontend
 # The editable install keeps the package rooted at /app so the server
 # finds frontend/ next to src/ (same layout as the dev checkout).
 RUN echo 'demucs==4.0.1' > /tmp/constraints.txt \
-    && pip install --no-cache-dir -c /tmp/constraints.txt -e ".[ml,export,server,roformer]"
+    && pip install --no-cache-dir -c /tmp/constraints.txt -e ".[ml,export,server,roformer,transcription]"
 
 RUN useradd --create-home tabforge \
     # pre-create the cache mount point owned by the app user: a named
